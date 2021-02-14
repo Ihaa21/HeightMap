@@ -28,7 +28,13 @@ call glslangValidator -DGBUFFER_FRAG=1 -S frag -e main -g -V -o %DataDir%\tiled_
 call glslangValidator -DTILED_DEFERRED_LIGHTING_VERT=1 -S vert -e main -g -V -o %DataDir%\tiled_deferred_lighting_vert.spv %CodeDir%\tiled_deferred_shaders.cpp
 call glslangValidator -DTILED_DEFERRED_LIGHTING_FRAG=1 -S frag -e main -g -V -o %DataDir%\tiled_deferred_lighting_frag.spv %CodeDir%\tiled_deferred_shaders.cpp
 
+REM Shadows
 call glslangValidator -DSHADOW_VERT=1 -S vert -e main -g -V -o %DataDir%\shadow_vert.spv %CodeDir%\tiled_deferred_shaders.cpp
+
+REM Height Map
+call glslangValidator -DGBUFFER_VERT=1 -S vert -e main -g -V -o %DataDir%\height_map_gbuffer_vert.spv %CodeDir%\height_map_shaders.cpp
+call glslangValidator -DGBUFFER_FRAG=1 -S frag -e main -g -V -o %DataDir%\height_map_gbuffer_frag.spv %CodeDir%\height_map_shaders.cpp
+call glslangValidator -DSHADOW_VERT=1 -S vert -e main -g -V -o %DataDir%\height_map_shadow_vert.spv %CodeDir%\height_map_shaders.cpp
 
 REM USING HLSL IN VK USING DXC
 REM set DxcDir=C:\Tools\DirectXShaderCompiler\build\Debug\bin
@@ -39,8 +45,8 @@ copy %AssimpDir%\assimp\bin\assimp-vc142-mt.dll %OutputDir%\assimp-vc142-mt.dll
 
 REM 64-bit build
 echo WAITING FOR PDB > lock.tmp
-cl %CommonCompilerFlags% %CodeDir%\heightmap_demo.cpp -Fmheightmap_demo.map -LD /link %CommonLinkerFlags% -incremental:no -opt:ref -PDB:heightmap_demo_%random%.pdb -EXPORT:Init -EXPORT:Destroy -EXPORT:SwapChainChange -EXPORT:CodeReload -EXPORT:MainLoop
+cl %CommonCompilerFlags% %CodeDir%\height_map_demo.cpp -Fmheight_map_demo.map -LD /link %CommonLinkerFlags% -incremental:no -opt:ref -PDB:height_map_demo_%random%.pdb -EXPORT:Init -EXPORT:Destroy -EXPORT:SwapChainChange -EXPORT:CodeReload -EXPORT:MainLoop
 del lock.tmp
-call cl %CommonCompilerFlags% -DDLL_NAME=heightmap_demo -Feheightmap_demo.exe %LibsDir%\framework_vulkan\win32_main.cpp -Fmheightmap_demo.map /link %CommonLinkerFlags%
+call cl %CommonCompilerFlags% -DDLL_NAME=height_map_demo -Feheight_map_demo.exe %LibsDir%\framework_vulkan\win32_main.cpp -Fmheight_map_demo.map /link %CommonLinkerFlags%
 
 popd

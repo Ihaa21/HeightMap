@@ -1,5 +1,5 @@
 
-#include "heightmap_demo.h"
+#include "height_map_demo.h"
 #include "tiled_deferred.cpp"
 
 /*
@@ -271,8 +271,8 @@ DEMO_INIT(Init)
     }
 
     // NOTE: Create render data
-    DemoState->RenderWidth = 800;
-    DemoState->RenderHeight = u32(f32(DemoState->RenderWidth) / (f32(RenderState->WindowWidth) / f32(RenderState->WindowHeight)));
+    DemoState->RenderWidth = RenderState->WindowWidth;
+    DemoState->RenderHeight = RenderState->WindowHeight;
     DemoState->RenderFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
     {
         renderer_create_info CreateInfo = {};
@@ -380,8 +380,8 @@ DEMO_SWAPCHAIN_CHANGE(SwapChainChange)
 
     DemoState->Scene.Camera.PerspAspectRatio = f32(RenderState->WindowWidth / RenderState->WindowHeight);
 
-    DemoState->RenderWidth = Min(u32(800), RenderState->WindowWidth);
-    DemoState->RenderHeight = u32(f32(DemoState->RenderWidth) / (f32(RenderState->WindowWidth) / f32(RenderState->WindowHeight)));
+    DemoState->RenderWidth = RenderState->WindowWidth;
+    DemoState->RenderHeight = RenderState->WindowHeight;
     TiledDeferredSwapChainChange(&DemoState->TiledDeferredState, DemoState->RenderWidth, DemoState->RenderHeight,
                                  DemoState->RenderFormat, &DemoState->Scene, &DemoState->CopyToSwapDesc);
 }
@@ -651,6 +651,10 @@ DEMO_MAIN_LOOP(MainLoop)
             CameraUpdate(&Scene->Camera, CurrInput, PrevInput);
         }
 
+        HeightMapBeginFrame(Scene, &DemoState->TiledDeferredState.HeightMap, CurrInput->MousePixelPos,
+                            CurrInput->MouseDown && !(DemoState->UiState.MouseTouchingUi || DemoState->UiState.ProcessedInteraction),
+                            FrameTime);
+        
         //
         // NOTE: Populate scene
         //
@@ -664,11 +668,6 @@ DEMO_MAIN_LOOP(MainLoop)
             //v4 GrassColor = (1.0f / 255.0f) * V4(54.0f, 102.0f, 80.0f, 255.0f);
             v4 GrassColor = V4(0, 1, 0, 1);
             v4 PillarColor = (1.0f / 255.0f) * V4(41.0f, 74.0f, 86.0f, 255.0f);
-
-            // NOTE: Ground
-            SceneOpaqueInstanceAdd(Scene, DemoState->Cube, DemoState->WhiteTexture,
-                                   M4Pos(V3(0.0f, -3.0f, 0.0f)) * M4Scale(V3(100.0f, 1.0f, 100.0f)),
-                                   GrassColor, 2);
             
             // NOTE: Cube
             SceneOpaqueInstanceAdd(Scene, DemoState->Cube, DemoState->WhiteTexture,

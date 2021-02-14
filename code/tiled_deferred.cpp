@@ -36,6 +36,176 @@ inline directional_shadow ShadowCreate(u32 Width, u32 Height, VkDescriptorSet Ti
     return Result;
 }
 
+inline height_map HeightMapCreate(u32 Width, u32 Height)
+{
+    height_map Result = {};
+
+    Result.UniformsCpu.Width = Width;
+    Result.UniformsCpu.Height = Height;
+    
+    Result.Arena = VkLinearArenaCreate(RenderState->Device, RenderState->LocalMemoryId, MegaBytes(64));
+    Result.UniformBuffer = VkBufferCreate(RenderState->Device, &Result.Arena, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                          sizeof(height_map_uniforms));
+    Result.IndexBuffer = VkBufferCreate(RenderState->Device, &Result.Arena, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                                        sizeof(u32) * (Width - 1) * (Height - 1) * 6);
+
+    Result.HeightMap = VkImageCreate(RenderState->Device, &Result.Arena, Width, Height, VK_FORMAT_R32_SFLOAT,
+                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+    Result.HeightMapData = PushArray(&RenderState->CpuArena, f32, Width * Height);
+    ZeroMem(Result.HeightMapData, sizeof(f32)*Width*Height);
+
+    {
+        Result.ReadBackMemory = VkMemoryAllocate(RenderState->Device, RenderState->StagingMemoryId, sizeof(height_map_readback));
+        Result.ReadBackBuffer = VkBufferCreate(RenderState->Device, Result.ReadBackMemory, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                               sizeof(height_map_readback));
+        VkCheckResult(vkMapMemory(RenderState->Device, Result.ReadBackMemory, 0, sizeof(height_map_readback), 0, (void**)&Result.ReadBackPtr));
+    }
+
+    {
+        vk_descriptor_layout_builder Builder = VkDescriptorLayoutBegin(&Result.DescLayout);
+        VkDescriptorLayoutAdd(&Builder, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
+        VkDescriptorLayoutAdd(&Builder, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
+        VkDescriptorLayoutAdd(&Builder, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
+        VkDescriptorLayoutEnd(RenderState->Device, &Builder);
+    }
+
+    Result.Descriptor = VkDescriptorSetAllocate(RenderState->Device, RenderState->DescriptorPool, Result.DescLayout);
+    VkDescriptorBufferWrite(&RenderState->DescriptorManager, Result.Descriptor, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, Result.UniformBuffer);
+    VkDescriptorImageWrite(&RenderState->DescriptorManager, Result.Descriptor, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                           Result.HeightMap.View, DemoState->PointSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    VkDescriptorBufferWrite(&RenderState->DescriptorManager, Result.Descriptor, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Result.ReadBackBuffer);
+
+    return Result;
+}
+
+inline void HeightMapTransfer(render_scene* Scene, height_map* HeightMap)
+{
+    // NOTE: Push index buffer
+    {
+        u32* GpuData = VkTransferPushWriteArray(&RenderState->TransferManager, HeightMap->IndexBuffer, u32,
+                                                (HeightMap->UniformsCpu.Width - 1) * (HeightMap->UniformsCpu.Height - 1) * 6,
+                                                BarrierMask(VkAccessFlagBits(0), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT),
+                                                BarrierMask(VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT));
+
+        for (u32 Y = 0; Y < (HeightMap->UniformsCpu.Height - 1); ++Y)
+        {
+            for (u32 X = 0; X < (HeightMap->UniformsCpu.Width - 1); ++X)
+            {
+                *GpuData++ = Y * HeightMap->UniformsCpu.Height + X;
+                *GpuData++ = Y * HeightMap->UniformsCpu.Height + (X + 1);
+                *GpuData++ = (Y + 1) * HeightMap->UniformsCpu.Height + (X + 1);
+                *GpuData++ = (Y + 1) * HeightMap->UniformsCpu.Height + (X + 1);
+                *GpuData++ = (Y + 1) * HeightMap->UniformsCpu.Height + X;
+                *GpuData++ = Y * HeightMap->UniformsCpu.Height + X;
+            }
+        }
+    }
+
+    // NOTE: Push initial height map
+    {
+        f32* GpuMemory = (f32*)VkTransferPushWriteImage(&RenderState->TransferManager, HeightMap->HeightMap.Image,
+                                                        HeightMap->UniformsCpu.Width, HeightMap->UniformsCpu.Height, sizeof(f32), 
+                                                        VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                                        BarrierMask(VkAccessFlagBits(0), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT),
+                                                        BarrierMask(VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT));
+
+        Copy(HeightMap->HeightMapData, GpuMemory, sizeof(f32) * HeightMap->UniformsCpu.Width * HeightMap->UniformsCpu.Height);
+    }
+}
+
+inline void HeightMapBeginFrame(render_scene* Scene, height_map* HeightMap, v2i MouseWindowPos, b32 MouseDown, f32 FrameTime)
+{
+    v3 Scale = V3(10.0f, 10.0f, 1.0f);
+    m4 WTransform = M4Pos(V3(0.0f, -2.0f, 0.0f)) * M4Rotation(V3(-Pi32/2.0f, 0.0f, 0.0f)) * M4Scale(Scale);
+    HeightMap->UniformsCpu.WVTransform = CameraGetV(&Scene->Camera) * WTransform;
+    HeightMap->UniformsCpu.WVPTransform = CameraGetP(&Scene->Camera) * HeightMap->UniformsCpu.WVTransform;
+    HeightMap->UniformsCpu.ShadowTransform = Scene->DirectionalLight.GpuData.VPTransform * WTransform;
+
+    // NOTE: Convert from window pos to pixel pos
+    v2i MousePixelPos = V2i((V2(MouseWindowPos) / V2(RenderState->WindowWidth, RenderState->WindowHeight)) * V2(DemoState->RenderWidth, DemoState->RenderHeight));
+    MousePixelPos.y = DemoState->RenderHeight - MousePixelPos.y;
+    
+    HeightMap->UniformsCpu.MousePixelPos = MousePixelPos;
+    HeightMap->UniformsCpu.MaterialId = SceneMaterialAdd(Scene, V4(0.2f, 1.0f, 0.2f, 1.0f), 32);
+    HeightMap->UniformsCpu.ColorId = DemoState->WhiteTexture;
+    
+    // NOTE: Push uniforms
+    {
+        height_map_uniforms* GpuData = VkTransferPushWriteStruct(&RenderState->TransferManager, HeightMap->UniformBuffer, height_map_uniforms,
+                                                                 BarrierMask(VkAccessFlagBits(0), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT),
+                                                                 BarrierMask(VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT));
+        Copy(&HeightMap->UniformsCpu, GpuData, sizeof(height_map_uniforms));
+    }
+
+    if (MouseDown)
+    {
+        // TODO: Make this UI configurable
+        HeightMap->HeightBrush = HeightBrush_Gaussian;
+        HeightMap->BrushRadius = V2(1.0f);
+        HeightMap->BrushVel = 1.0f;
+
+        v3 ReadBackPos = HeightMap->ReadBackPtr->ViewIntersectPos;
+        // NOTE: Write back the default value
+        HeightMap->ReadBackPtr->ViewIntersectPos = V3(-1.0f);
+
+        if (ReadBackPos.x != -1.0f || ReadBackPos.y != -1.0f || ReadBackPos.z != -1.0f)
+        {
+            // NOTE: Convert to model space
+            ReadBackPos = (Inverse(HeightMap->UniformsCpu.WVTransform) * V4(ReadBackPos, 1.0f)).xyz;
+
+        
+            // NOTE: Convert from model pos to texel space
+            v2i BrushTexelCenter = V2i((ReadBackPos.xy + V2(0.5f)) * V2(HeightMap->UniformsCpu.Width, HeightMap->UniformsCpu.Height));
+            v2i BrushTexelRadius = V2i((HeightMap->BrushRadius / Scale.xy) * V2(HeightMap->UniformsCpu.Width, HeightMap->UniformsCpu.Height));
+
+            // NOTE: Calculate bounding box
+            v2i BrushMin = Clamp(BrushTexelCenter - BrushTexelRadius, V2i(0), V2i(HeightMap->UniformsCpu.Width, HeightMap->UniformsCpu.Height));
+            v2i BrushDim = 2*BrushTexelRadius;
+            BrushDim = BrushDim - Max(V2i(0), (BrushMin + BrushDim - V2i(HeightMap->UniformsCpu.Width, HeightMap->UniformsCpu.Height)));
+
+            // NOTE: Push height map
+            f32* GpuMemory = (f32*)VkTransferPushWriteImage(&RenderState->TransferManager, HeightMap->HeightMap.Image, BrushMin.x, BrushMin.y,
+                                                            BrushDim.x, BrushDim.y, sizeof(f32),  VK_IMAGE_ASPECT_COLOR_BIT,
+                                                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                                            BarrierMask(VkAccessFlagBits(0), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT),
+                                                            BarrierMask(VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT));
+
+            for (i32 Y = 0; Y < BrushDim.y; ++Y)
+            {
+                for (i32 X = 0; X < BrushDim.x; ++X)
+                {
+                    u32 OriginalX = X + BrushMin.x;
+                    u32 OriginalY = Y + BrushMin.y;
+                    f32* OriginalHeight = HeightMap->HeightMapData + OriginalY * HeightMap->UniformsCpu.Width + OriginalX;
+
+                    f32 ExtraHeight = 0.0f;
+                    switch (HeightMap->HeightBrush)
+                    {
+                        case HeightBrush_Gaussian:
+                        {
+                            v2 NormalizedPos = (V2(OriginalX, OriginalY) - V2(BrushTexelCenter)) / V2(BrushTexelRadius);
+                            NormalizedPos = 0.5f*NormalizedPos;
+
+                            f32 StandardDeviation = 0.3f;
+                            ExtraHeight = ((1.0f / SquareRoot(2*Pi32*Square(StandardDeviation))) *
+                                           Exp(-0.5f * (Square(NormalizedPos.x) + Square(NormalizedPos.y)) / Square(StandardDeviation)));
+                        } break;
+
+                        case HeightBrush_Square:
+                        {
+                            ExtraHeight = 1.0f;
+                        } break;
+                    }
+
+                    f32 NewHeight = *OriginalHeight + ExtraHeight * HeightMap->BrushVel * FrameTime;
+                    *OriginalHeight = NewHeight;
+                    *GpuMemory++ = NewHeight;
+                }
+            }
+        }
+    }
+}
+
 inline void TiledDeferredSwapChainChange(tiled_deferred_state* State, u32 Width, u32 Height, VkFormat ColorFormat,
                                          render_scene* Scene, VkDescriptorSet* OutputRtSet)
 {
@@ -220,6 +390,7 @@ inline void TiledDeferredCreate(renderer_create_info CreateInfo, VkDescriptorSet
     }
     
     Result->Shadow = ShadowCreate(1024, 1024, Result->TiledDeferredDescriptor);
+    Result->HeightMap = HeightMapCreate(128, 128); //1024, 1024);
     TiledDeferredSwapChainChange(Result, CreateInfo.Width, CreateInfo.Height, CreateInfo.ColorFormat, CreateInfo.Scene, OutputRtSet);
         
     // NOTE: Create PSOs
@@ -299,6 +470,39 @@ inline void TiledDeferredCreate(renderer_create_info CreateInfo, VkDescriptorSet
                 Result->GBufferPipeline = VkPipelineBuilderEnd(&Builder, RenderState->Device, &RenderState->PipelineManager,
                                                                Result->GBufferPass.RenderPass, 0, DescriptorLayouts, ArrayCount(DescriptorLayouts));
             }
+
+            // NOTE: Height Map GBuffer PSO
+            {
+                vk_pipeline_builder Builder = VkPipelineBuilderBegin(&DemoState->TempArena);
+
+                // NOTE: Shaders
+                VkPipelineShaderAdd(&Builder, "height_map_gbuffer_vert.spv", "main", VK_SHADER_STAGE_VERTEX_BIT);
+                VkPipelineShaderAdd(&Builder, "height_map_gbuffer_frag.spv", "main", VK_SHADER_STAGE_FRAGMENT_BIT);
+                
+                // NOTE: Specify input vertex data format
+                VkPipelineVertexBindingBegin(&Builder);
+                VkPipelineVertexBindingEnd(&Builder);
+
+                VkPipelineInputAssemblyAdd(&Builder, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE);
+                VkPipelineDepthStateAdd(&Builder, VK_TRUE, VK_TRUE, VK_COMPARE_OP_GREATER);
+
+                VkPipelineColorAttachmentAdd(&Builder, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
+                                             VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO);
+                VkPipelineColorAttachmentAdd(&Builder, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
+                                             VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO);
+                VkPipelineColorAttachmentAdd(&Builder, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
+                                             VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO);
+
+                VkDescriptorSetLayout DescriptorLayouts[] =
+                    {
+                        Result->TiledDeferredDescLayout,
+                        CreateInfo.SceneDescLayout,
+                        Result->HeightMap.DescLayout,
+                    };
+            
+                Result->HeightMap.GBufferPipeline = VkPipelineBuilderEnd(&Builder, RenderState->Device, &RenderState->PipelineManager,
+                                                                         Result->GBufferPass.RenderPass, 0, DescriptorLayouts, ArrayCount(DescriptorLayouts));
+            }
         }
 
         // NOTE: Shadow Pass
@@ -341,7 +545,7 @@ inline void TiledDeferredCreate(renderer_create_info CreateInfo, VkDescriptorSet
 
                 VkPipelineInputAssemblyAdd(&Builder, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE);
                 VkPipelineDepthStateAdd(&Builder, VK_TRUE, VK_TRUE, VK_COMPARE_OP_GREATER);
-                VkPipelineDepthOffsetAdd(&Builder, 4.0f, 1.0f, 1.5f);
+                //VkPipelineDepthOffsetAdd(&Builder, 4.0f, 1.0f, 1.5f);
 
                 VkDescriptorSetLayout DescriptorLayouts[] =
                     {
@@ -352,6 +556,33 @@ inline void TiledDeferredCreate(renderer_create_info CreateInfo, VkDescriptorSet
                 Result->Shadow.Pipeline = VkPipelineBuilderEnd(&Builder, RenderState->Device, &RenderState->PipelineManager,
                                                                Result->Shadow.Target.RenderPass, 0, DescriptorLayouts,
                                                                ArrayCount(DescriptorLayouts));
+            }
+            
+            // NOTE: Height Map Shadow PSO
+            {
+                vk_pipeline_builder Builder = VkPipelineBuilderBegin(&DemoState->TempArena);
+
+                // NOTE: Shaders
+                VkPipelineShaderAdd(&Builder, "height_map_shadow_vert.spv", "main", VK_SHADER_STAGE_VERTEX_BIT);
+                
+                // NOTE: Specify input vertex data format
+                VkPipelineVertexBindingBegin(&Builder);
+                VkPipelineVertexBindingEnd(&Builder);
+
+                VkPipelineInputAssemblyAdd(&Builder, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE);
+                VkPipelineDepthStateAdd(&Builder, VK_TRUE, VK_TRUE, VK_COMPARE_OP_GREATER);
+                //VkPipelineDepthOffsetAdd(&Builder, 4.0f, 1.0f, 1.5f);
+
+                VkDescriptorSetLayout DescriptorLayouts[] =
+                    {
+                        Result->TiledDeferredDescLayout,
+                        CreateInfo.SceneDescLayout,
+                        Result->HeightMap.DescLayout,
+                    };
+            
+                Result->HeightMap.ShadowPipeline = VkPipelineBuilderEnd(&Builder, RenderState->Device, &RenderState->PipelineManager,
+                                                                        Result->Shadow.Target.RenderPass, 0, DescriptorLayouts,
+                                                                        ArrayCount(DescriptorLayouts));
             }
         }
 
@@ -426,6 +657,7 @@ inline void TiledDeferredCreate(renderer_create_info CreateInfo, VkDescriptorSet
 inline void TiledDeferredAddMeshes(tiled_deferred_state* State, render_scene* Scene, render_mesh* QuadMesh)
 {
     State->QuadMesh = QuadMesh;
+    HeightMapTransfer(Scene, &State->HeightMap);
 }
 
 inline void TiledDeferredRender(vk_commands Commands, tiled_deferred_state* State, render_scene* Scene)
@@ -446,92 +678,52 @@ inline void TiledDeferredRender(vk_commands Commands, tiled_deferred_state* Stat
         vkCmdFillBuffer(Commands.Buffer, State->LightIndexCounter_O, 0, sizeof(u32), 0);
         vkCmdFillBuffer(Commands.Buffer, State->LightIndexCounter_T, 0, sizeof(u32), 0);
     }
-
-    // NOTE: Generate Grass
-    {
-        //VkBarrierBufferAdd(&RenderState->BarrierManager, VK_ACCESS_INDIRECT_COMMAND_READ_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-        //                   VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, Grass->IndirectArg);
-
-#if 0
-        // NOTE: Grass Lines
-        {
-            grass_lines* GrassLines = &State->GrassLines;
-
-            VkBarrierBufferAdd(&RenderState->BarrierManager, VK_ACCESS_INDIRECT_COMMAND_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                               VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, GrassLines->IndirectArg);
-            VkBarrierManagerFlush(&RenderState->BarrierManager, Commands.Buffer);
-            
-            vk_pipeline* Pipeline = GrassLines->GenBladesPipeline;
-            vkCmdBindPipeline(Commands.Buffer, VK_PIPELINE_BIND_POINT_COMPUTE, Pipeline->Handle);
-            VkDescriptorSet DescriptorSets[] =
-                {
-                    GrassLines->Descriptor,
-                };
-            vkCmdBindDescriptorSets(Commands.Buffer, VK_PIPELINE_BIND_POINT_COMPUTE, Pipeline->Layout, 0, ArrayCount(DescriptorSets),
-                                    DescriptorSets, 0, 0);
-            u32 DispatchX = CeilU32(f32(GrassLines->UniformsCpu.NumBladesX) / f32(8));
-            u32 DispatchY = CeilU32(f32(GrassLines->UniformsCpu.NumBladesY) / f32(8));
-            vkCmdDispatch(Commands.Buffer, DispatchX, DispatchY, 1);
-
-            VkBarrierBufferAdd(&RenderState->BarrierManager, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                               VK_ACCESS_INDIRECT_COMMAND_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, GrassLines->IndirectArg);
-            VkBarrierManagerFlush(&RenderState->BarrierManager, Commands.Buffer);
-        }
-#endif
-        
-#if 0
-        // NOTE: Grass Blades
-        {
-            grass_blades* GrassBlades = &State->GrassBlades;
-
-            VkBarrierBufferAdd(&RenderState->BarrierManager, VK_ACCESS_INDIRECT_COMMAND_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                               VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, GrassBlades->IndirectArg);
-            VkBarrierManagerFlush(&RenderState->BarrierManager, Commands.Buffer);
-            
-            vk_pipeline* Pipeline = GrassBlades->GenBladesPipeline;
-            vkCmdBindPipeline(Commands.Buffer, VK_PIPELINE_BIND_POINT_COMPUTE, Pipeline->Handle);
-            VkDescriptorSet DescriptorSets[] =
-                {
-                    GrassBlades->Descriptor,
-                };
-            vkCmdBindDescriptorSets(Commands.Buffer, VK_PIPELINE_BIND_POINT_COMPUTE, Pipeline->Layout, 0, ArrayCount(DescriptorSets),
-                                    DescriptorSets, 0, 0);
-            u32 DispatchX = CeilU32(f32(GrassBlades->UniformsCpu.NumBladesX) / f32(8));
-            u32 DispatchY = CeilU32(f32(GrassBlades->UniformsCpu.NumBladesY) / f32(8));
-            vkCmdDispatch(Commands.Buffer, DispatchX, DispatchY, 1);
-
-            VkBarrierBufferAdd(&RenderState->BarrierManager, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                               VK_ACCESS_INDIRECT_COMMAND_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, GrassBlades->IndirectArg);
-            VkBarrierManagerFlush(&RenderState->BarrierManager, Commands.Buffer);
-        }
-#endif
-        
-        //VkBarrierBufferAdd(&RenderState->BarrierManager, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        //                   VK_ACCESS_INDIRECT_COMMAND_READ_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, Grass->IndirectArg);
-    }
     
     // NOTE: Shadow Pass
     RenderTargetPassBegin(&State->Shadow.Target, Commands, RenderTargetRenderPass_SetViewPort | RenderTargetRenderPass_SetScissor);
     {
-        vk_pipeline* Pipeline = State->Shadow.Pipeline;
-        vkCmdBindPipeline(Commands.Buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, Pipeline->Handle);
-        VkDescriptorSet DescriptorSets[] =
-            {
-                State->TiledDeferredDescriptor,
-                Scene->SceneDescriptor,
-            };
-        vkCmdBindDescriptorSets(Commands.Buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, Pipeline->Layout, 0,
-                                ArrayCount(DescriptorSets), DescriptorSets, 0, 0);
-
-        for (u32 InstanceId = 0; InstanceId < Scene->NumOpaqueInstances; ++InstanceId)
+        // NOTE: Entites
         {
-            instance_entry* CurrInstance = Scene->OpaqueInstances + InstanceId;
-            render_mesh* CurrMesh = Scene->RenderMeshes + CurrInstance->MeshId;
+            vk_pipeline* Pipeline = State->Shadow.Pipeline;
+            vkCmdBindPipeline(Commands.Buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, Pipeline->Handle);
+            VkDescriptorSet DescriptorSets[] =
+                {
+                    State->TiledDeferredDescriptor,
+                    Scene->SceneDescriptor,
+                };
+            vkCmdBindDescriptorSets(Commands.Buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, Pipeline->Layout, 0,
+                                    ArrayCount(DescriptorSets), DescriptorSets, 0, 0);
+
+            for (u32 InstanceId = 0; InstanceId < Scene->NumOpaqueInstances; ++InstanceId)
+            {
+                instance_entry* CurrInstance = Scene->OpaqueInstances + InstanceId;
+                render_mesh* CurrMesh = Scene->RenderMeshes + CurrInstance->MeshId;
+            
+                VkDeviceSize Offset = 0;
+                vkCmdBindVertexBuffers(Commands.Buffer, 0, 1, &CurrMesh->VertexBuffer, &Offset);
+                vkCmdBindIndexBuffer(Commands.Buffer, CurrMesh->IndexBuffer, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(Commands.Buffer, CurrMesh->NumIndices, 1, 0, 0, InstanceId);
+            }
+        }
+
+        // NOTE: Height Map
+        {
+            height_map* HeightMap = &State->HeightMap;
+            vk_pipeline* Pipeline = HeightMap->ShadowPipeline;
+            vkCmdBindPipeline(Commands.Buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, Pipeline->Handle);
+
+            VkDescriptorSet DescriptorSets[] =
+                {
+                    State->TiledDeferredDescriptor,
+                    Scene->SceneDescriptor,
+                    HeightMap->Descriptor,
+                };
+            vkCmdBindDescriptorSets(Commands.Buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, Pipeline->Layout, 0,
+                                    ArrayCount(DescriptorSets), DescriptorSets, 0, 0);
             
             VkDeviceSize Offset = 0;
-            vkCmdBindVertexBuffers(Commands.Buffer, 0, 1, &CurrMesh->VertexBuffer, &Offset);
-            vkCmdBindIndexBuffer(Commands.Buffer, CurrMesh->IndexBuffer, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(Commands.Buffer, CurrMesh->NumIndices, 1, 0, 0, InstanceId);
+            vkCmdBindIndexBuffer(Commands.Buffer, HeightMap->IndexBuffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(Commands.Buffer, (HeightMap->UniformsCpu.Width-1) * (HeightMap->UniformsCpu.Height-1) * 6, 1, 0, 0, 0);
         }
     }
     RenderTargetPassEnd(Commands);
@@ -539,6 +731,27 @@ inline void TiledDeferredRender(vk_commands Commands, tiled_deferred_state* Stat
     RenderTargetPassBegin(&State->GBufferPass, Commands, RenderTargetRenderPass_SetViewPort | RenderTargetRenderPass_SetScissor);
     // NOTE: GBuffer Pass
     {
+        // NOTE: Height Map
+        // IMPORTANT: Goes first so we get a accurate pixel pos for our mouse on the height map
+        {
+            height_map* HeightMap = &State->HeightMap;
+            vk_pipeline* Pipeline = HeightMap->GBufferPipeline;
+            vkCmdBindPipeline(Commands.Buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, Pipeline->Handle);
+
+            VkDescriptorSet DescriptorSets[] =
+                {
+                    State->TiledDeferredDescriptor,
+                    Scene->SceneDescriptor,
+                    HeightMap->Descriptor,
+                };
+            vkCmdBindDescriptorSets(Commands.Buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, Pipeline->Layout, 0,
+                                    ArrayCount(DescriptorSets), DescriptorSets, 0, 0);
+            
+            VkDeviceSize Offset = 0;
+            vkCmdBindIndexBuffer(Commands.Buffer, HeightMap->IndexBuffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(Commands.Buffer, (HeightMap->UniformsCpu.Width-1) * (HeightMap->UniformsCpu.Height-1) * 6, 1, 0, 0, 0);
+        }
+
         // NOTE: Regular entities
         {
             vk_pipeline* Pipeline = State->GBufferPipeline;

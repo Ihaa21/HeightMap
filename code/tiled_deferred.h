@@ -25,11 +25,65 @@ struct directional_shadow
     vk_pipeline* Pipeline;
 };
 
+struct height_map_uniforms
+{
+    m4 WVPTransform;
+    m4 WVTransform;
+    m4 ShadowTransform;
+    v2i MousePixelPos;
+    u32 MaterialId;
+    u32 ColorId;
+    u32 Width;
+    u32 Height;
+    u32 Pad[2];
+};
+
+struct height_map_readback
+{
+    v3 ViewIntersectPos;
+};
+
+enum height_brush
+{
+    HeightBrush_None,
+
+    HeightBrush_Gaussian,
+    HeightBrush_Square,
+};
+
+struct height_map
+{
+    vk_linear_arena Arena;
+
+    // NOTE: Input
+    height_brush HeightBrush;
+    v2 BrushRadius;
+    f32 BrushVel;
+    
+    height_map_uniforms UniformsCpu;
+    VkBuffer UniformBuffer;
+    VkBuffer IndexBuffer;
+
+    vk_image HeightMap;
+    f32* HeightMapData;
+    
+    VkDeviceMemory ReadBackMemory;
+    VkBuffer ReadBackBuffer;
+    height_map_readback* ReadBackPtr;
+
+    VkDescriptorSetLayout DescLayout;
+    VkDescriptorSet Descriptor;
+
+    vk_pipeline* GBufferPipeline;
+    vk_pipeline* ShadowPipeline;
+};
+
 struct tiled_deferred_state
 {
     vk_linear_arena RenderTargetArena;
 
     directional_shadow Shadow;
+    height_map HeightMap;
     
     // NOTE: GBuffer
     VkImage GBufferPositionImage;
